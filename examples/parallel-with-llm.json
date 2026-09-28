@@ -1,0 +1,34 @@
+{
+  "name": "Parallel API Fetcher With Summary",
+  "input": {"requested_by": "test-user"},
+  "dag": {
+    "nodes": [
+      {"id": "input", "handler": "input", "dependencies": []},
+      {
+        "id": "get_user",
+        "handler": "call_external_service",
+        "dependencies": ["input"],
+        "config": {"url": "mock://users/{{ input.requested_by }}"}
+      },
+      {
+        "id": "get_posts",
+        "handler": "call_external_service",
+        "dependencies": ["input"],
+        "config": {"url": "mock://posts"}
+      },
+      {
+        "id": "generate_summary",
+        "handler": "llm_service",
+        "dependencies": ["get_user", "get_posts"],
+        "config": {
+          "prompt": "Summarize {{ get_user.data.message }} and {{ get_posts.data.message }}"
+        }
+      },
+      {
+        "id": "output",
+        "handler": "output",
+        "dependencies": ["generate_summary"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,199 @@
+services:
+  api-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: woe
+      POSTGRES_PASSWORD: woe
+      POSTGRES_DB: woe_api
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U woe -d woe_api"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - api-postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/api/init-test-db.sh:/docker-entrypoint-initdb.d/01-create-test-db.sh:ro
+
+  engine-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: woe
+      POSTGRES_PASSWORD: woe
+      POSTGRES_DB: woe_engine
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U woe -d woe_engine"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - engine-postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/engine/init-test-db.sh:/docker-entrypoint-initdb.d/01-create-test-db.sh:ro
+
+  worker-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: woe
+      POSTGRES_PASSWORD: woe
+      POSTGRES_DB: woe_worker
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U woe -d woe_worker"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - worker-postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/worker/init-test-db.sh:/docker-entrypoint-initdb.d/01-create-test-db.sh:ro
+
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092,PLAINTEXT_HOST://:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    volumes:
+      - ./infrastructure/kafka/create-topics.sh:/scripts/create-topics.sh:ro
+
+  api-migrate:
+    build:
+      context: .
+      target: runtime
+    command: alembic -c infrastructure/postgres/api/alembic.ini upgrade head
+    environment:
+      WOE_API_DATABASE_URL: postgresql+asyncpg://woe:woe@api-postgres:5432/woe_api
+    depends_on:
+      api-postgres:
+        condition: service_healthy
+
+  engine-migrate:
+    build:
+      context: .
+      target: runtime
+    command: alembic -c infrastructure/postgres/engine/alembic.ini upgrade head
+    environment:
+      WOE_ENGINE_DATABASE_URL: postgresql+asyncpg://woe:woe@engine-postgres:5432/woe_engine
+    depends_on:
+      engine-postgres:
+        condition: service_healthy
+
+  worker-migrate:
+    build:
+      context: .
+      target: runtime
+    command: alembic -c infrastructure/postgres/worker/alembic.ini upgrade head
+    environment:
+      WOE_WORKER_DATABASE_URL: postgresql+asyncpg://woe:woe@worker-postgres:5432/woe_worker
+    depends_on:
+      worker-postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      WOE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      WOE_API_DATABASE_URL: postgresql+asyncpg://woe:woe@api-postgres:5432/woe_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      api-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  engine:
+    build:
+      context: .
+      target: runtime
+    command: python -m apps.engine.main
+    environment:
+      WOE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      WOE_ENGINE_DATABASE_URL: postgresql+asyncpg://woe:woe@engine-postgres:5432/woe_engine
+      WOE_ENGINE_METRICS_PORT: 9101
+    expose:
+      - "9101"
+    depends_on:
+      engine-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: python -m apps.worker.main
+    environment:
+      WOE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      WOE_WORKER_DATABASE_URL: postgresql+asyncpg://woe:woe@worker-postgres:5432/woe_worker
+      WOE_WORKER_PROCESSING_LEASE_SECONDS: 60
+      WOE_WORKER_METRICS_PORT: 9102
+    expose:
+      - "9102"
+    depends_on:
+      worker-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  integration-tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    command: python -m pytest -m integration tests/integration -q
+    environment:
+      WOE_TEST_API_URL: http://api:8000
+      WOE_TEST_API_DATABASE_URL: postgresql+asyncpg://woe:woe@api-postgres:5432/woe_api_test
+      WOE_TEST_ENGINE_DATABASE_URL: postgresql+asyncpg://woe:woe@engine-postgres:5432/woe_engine_test
+      WOE_TEST_WORKER_DATABASE_URL: postgresql+asyncpg://woe:woe@worker-postgres:5432/woe_worker_test
+      WOE_TEST_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      api:
+        condition: service_healthy
+      engine:
+        condition: service_started
+      worker:
+        condition: service_started
+
+volumes:
+  api-postgres-data:
+  engine-postgres-data:
+  worker-postgres-data:
